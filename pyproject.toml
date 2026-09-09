@@ -1,0 +1,17 @@
+[project]
+name = "portfolio-repo-tools"
+version = "0.1.0"
+description = "Repository-level development infrastructure tooling for the portfolio"
+requires-python = ">=3.10"
+
+# The tools themselves are stdlib-only by design: they run against arbitrary
+# repositories, often in environments nobody prepared for them, so a dependency
+# is a failure mode. pytest is a development dependency only.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
