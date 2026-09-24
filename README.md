@@ -42,20 +42,60 @@ inspect, not proof that they overlap.** v1 is not authorized to read them and
 decide, so it hands the question back:
 
 ```
---authority-disposition EXISTING_AUTHORITY_COVERS_WORKFLOW   -> refuse, recorded
+--authority-disposition EXISTING_AUTHORITY_COVERS_WORKFLOW   -> successful no-op, recorded
 --authority-disposition COEXISTENCE_EXPLICITLY_ALLOWED       -> write, delegating
 --authority-disposition NO_OVERLAP_CONFIRMED                 -> write
 ```
+
+`EXISTING_AUTHORITY_COVERS_WORKFLOW` is a **successful no-op**: the existing
+authority already owns branch and pull-request workflow here, so no `AGENTS.md`
+is warranted, nothing is written, and the tool exits `0`. It is not a refusal —
+the operator asked the right question and the answer is "nothing to do".
 
 Where coexistence is allowed, the generated file **names** the existing
 authorities and defers to them rather than restating anything they contain.
 
 ### Repository identity
 
-Taken from the `origin` remote, not the directory name — a worktree is named for
-the task, not the repository. HTTPS, SSH and `scp`-style remotes are all
-understood. With no remote, the directory name is used as a **documented
-fallback** and the report says so; `--repo-name` overrides it.
+The authoritative remote is `origin` when present; otherwise a **sole**
+non-origin remote (an `upstream` with no `origin` is still unambiguous). Several
+remotes without an `origin` are an ambiguity the tool **refuses** rather than
+resolving by enumeration order.
+
+Identity comes from that remote's URL, not the directory name — a worktree is
+named for the task, not the repository. HTTPS, SSH and `scp`-style remotes are
+all understood. With **no remote at all**, identity is the **primary worktree's
+basename** resolved from Git metadata — never a linked worktree's task directory
+name — and the report says so; `--repo-name` overrides it.
+
+### Default branch
+
+Resolved in exactly this order, with no other source:
+
+```
+1. explicit --default-branch  (accepted only if that branch actually exists)
+2. the authoritative remote's symbolic HEAD
+3. refuse
+```
+
+There is no fallback to a local `main`/`master`: writing "branch from main" into
+a canonical file naming a branch that is not this repository's default would
+replicate that error across every repository scaffolded the same way.
+
+### Consent and force
+
+> `--force` is replacement intent, not permission to bypass repository-truth checks.
+
+> `--yes` is consent, not authority.
+
+Neither bypasses an unresolved identity, an unresolved or nonexistent default
+branch, an authority collision, or an invalid disposition. A valid clean
+headless first creation needs no `--yes`; overwriting an existing `AGENTS.md`
+under `--force` in a non-TTY requires it.
+
+The write itself is atomic: the file is rendered to a sibling temp file and moved
+into place, so a failed or interrupted write leaves the original `AGENTS.md`
+untouched rather than exposing a half-written file.
 
 ## Tests
 

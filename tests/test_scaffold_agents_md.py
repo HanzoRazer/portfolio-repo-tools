@@ -1,4 +1,4 @@
-"""SCAFFOLD-DIST-001 — self-test for scripts/scaffold_agents_md.py.
+"""SCAFFOLD-DIST-002 — self-test for scripts/scaffold_agents_md.py.
 
 Every defect this scaffolder has had was an ENVIRONMENT-COUPLING bug: a worktree
 directory name, a case-insensitive filesystem, a non-TTY stdin, an undetectable
@@ -8,22 +8,27 @@ tool met a real repository.
 So these tests build **real temp git repos** and drive the real CLI as a
 subprocess, asserting on OUTPUT -- files written, file contents, exit codes --
 never on internal calls. Mocking the environment would test the model of the
-environment, and a wrong model of it is the entire defect history.
+environment, and a wrong model of it is the entire defect history. The single
+exception is the atomic-write failure test (T28), where the whole point is a
+replacement failure that cannot be provoked from the outside; there, and only
+there, ``os.replace`` is monkeypatched.
 
-Two families of test live here. The **seed tests** came from the original
-self-test and concern environmental correctness, which survived the change of
-product. The **contract tests** are new, and hold the narrower thing this tool
-was actually authorized to do: workflow discipline only, refusing wherever an
-existing authority might already own that ground.
+The reconciled contract this suite holds (G1-G8):
 
-The original suite's PR-template coverage is deliberately absent. That capability
-was removed rather than disabled, so there is nothing to test -- and a test
-asserting "the PR template is unchanged" would couple this tool to an authority
-it has no business knowing exists.
+* remote selection is ``origin`` if present, else a sole non-origin remote, and
+  a refusal when several remotes exist without an ``origin``;
+* with no remote, identity is the **primary worktree** basename, never a linked
+  worktree's directory name;
+* the default branch comes from an explicit existing branch or the authoritative
+  remote's symbolic HEAD -- never from guessing local ``main``/``master``;
+* an ``EXISTING_AUTHORITY_COVERS_WORKFLOW`` disposition is a **successful no-op**,
+  not a refusal;
+* the target is written atomically, so a failed write leaves the original intact.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +36,17 @@ from pathlib import Path
 import pytest
 
 SCAFFOLDER = Path(__file__).resolve().parents[1] / "scripts" / "scaffold_agents_md.py"
+
+
+def _load_module():
+    """Import the scaffolder as a module (for the one unit-level test, T28)."""
+    spec = importlib.util.spec_from_file_location("scaffold_agents_md", SCAFFOLDER)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    # Register before executing so dataclass processing can resolve the module.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -77,6 +93,19 @@ def _make_repo(
     return repo
 
 
+def _add_remote(repo: Path, name: str, url: str, *, head_branch: str | None = None) -> None:
+    """Add a non-origin remote, optionally with a resolvable symbolic HEAD."""
+    _git(repo, "remote", "add", name, url)
+    if head_branch:
+        _git(repo, "update-ref", f"refs/remotes/{name}/{head_branch}", "HEAD")
+        _git(
+            repo,
+            "symbolic-ref",
+            f"refs/remotes/{name}/HEAD",
+            f"refs/remotes/{name}/{head_branch}",
+        )
+
+
 def _run(repo: Path, *extra: str) -> subprocess.CompletedProcess:
     """Invoke the real CLI with stdin closed -- the agent-session condition."""
     return subprocess.run(
@@ -100,35 +129,38 @@ def _snapshot(repo: Path) -> dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------- #
-# Seed 1 — repository identity survives worktrees (defect #3)
+# Identity / remote (T01-T08)
 # --------------------------------------------------------------------------- #
 
 
-def test_heading_uses_remote_name_not_directory_name(tmp_path: Path) -> None:
-    """A worktree directory is named for the task, not the repository.
+def test_T01_linked_worktree_name_is_not_repository_identity(tmp_path: Path) -> None:
+    """A linked worktree's directory name must never become the repo identity.
 
-    This produced a real wrong file: run from a worktree at C:/tmp/ltb-sprints,
-    the heading read "Agent instructions - ltb-sprints".
+    Run from a real ``git worktree add`` checkout with no remote: identity must
+    be the PRIMARY worktree basename, not the linked directory's task name.
     """
-    repo = _make_repo(
-        tmp_path, name="ltb-sprints", remote="https://example.com/org/luthiers-toolbox.git"
-    )
-    assert _run(repo).returncode == 0
-    heading = (repo / "AGENTS.md").read_text(encoding="utf-8").splitlines()[0]
-    assert heading == "# Agent instructions — luthiers-toolbox"
-    assert "ltb-sprints" not in heading
+    primary = _make_repo(tmp_path, name="real-project", remote=None, branch="main")
+    _git(primary, "branch", "feature")
+    linked = tmp_path / "wt-task-branch"
+    _git(primary, "worktree", "add", str(linked), "feature")
+
+    result = _run(linked, "--default-branch", "main")
+    assert result.returncode == 0, result.stderr
+    heading = (linked / "AGENTS.md").read_text(encoding="utf-8").splitlines()[0]
+    assert heading == "# Agent instructions — real-project"
+    assert "wt-task-branch" not in heading
 
 
 @pytest.mark.parametrize(
     "remote",
     [
-        "https://example.com/org/tap_tone_pi.git",
-        "https://example.com/org/tap_tone_pi",
-        "git@example.com:org/tap_tone_pi.git",
-        "ssh://git@example.com/org/tap_tone_pi.git",
+        "https://example.com/org/tap_tone_pi.git",  # T02 HTTPS
+        "https://example.com/org/tap_tone_pi",       # T02 HTTPS no .git
+        "git@example.com:org/tap_tone_pi.git",       # T03 scp-style SSH
+        "ssh://git@example.com/org/tap_tone_pi.git",  # T04 ssh:// URL
     ],
 )
-def test_identity_is_correct_for_every_common_remote_form(
+def test_T02_T04_identity_is_correct_for_every_common_remote_form(
     tmp_path: Path, remote: str
 ) -> None:
     """Identity right for HTTPS and wrong for SSH would fail where it matters."""
@@ -138,113 +170,167 @@ def test_identity_is_correct_for_every_common_remote_form(
     assert body.splitlines()[0] == "# Agent instructions — tap_tone_pi"
 
 
-def test_no_remote_falls_back_to_directory_name_and_says_so(tmp_path: Path) -> None:
-    """The fallback is legitimate but must never be silent.
+def test_T05_no_remote_uses_primary_worktree_basename(tmp_path: Path) -> None:
+    """With no remote, identity is the primary worktree basename, surfaced.
 
-    With no origin there is no better identity available -- but the directory
-    name is exactly what produced defect #3, so the report has to surface it.
+    In the ordinary (non-linked) case the primary worktree IS the checkout, so
+    the basename equals the directory name -- but it is reported so the operator
+    can see that no remote named it.
     """
     repo = _make_repo(tmp_path, name="some-checkout", remote=None, branch="main")
-    result = _run(repo)
-    assert result.returncode == 0
+    result = _run(repo, "--default-branch", "main")
+    assert result.returncode == 0, result.stderr
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
     assert body.splitlines()[0] == "# Agent instructions — some-checkout"
-    assert "directory name" in result.stdout
-    assert "no origin remote" in result.stdout
+    assert "primary worktree" in result.stdout
+    assert "no remote" in result.stdout
 
 
-def test_repo_name_override_beats_the_fallback(tmp_path: Path) -> None:
+def test_T05_repo_name_override_beats_the_fallback(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path, name="some-checkout", remote=None, branch="main")
-    assert _run(repo, "--repo-name", "real-name").returncode == 0
+    assert _run(repo, "--repo-name", "real-name", "--default-branch", "main").returncode == 0
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
     assert body.splitlines()[0] == "# Agent instructions — real-name"
 
 
-# --------------------------------------------------------------------------- #
-# Seed 2 — non-TTY --force (defect #1)
-# --------------------------------------------------------------------------- #
+def test_T06_origin_wins_when_another_remote_also_exists(tmp_path: Path) -> None:
+    """``origin`` is authoritative even when other remotes are configured."""
+    repo = _make_repo(tmp_path, name="wt", remote="https://example.com/o/canonical.git")
+    _add_remote(repo, "upstream", "https://example.com/o/other.git")
+    result = _run(repo)
+    assert result.returncode == 0, result.stderr
+    heading = (repo / "AGENTS.md").read_text(encoding="utf-8").splitlines()[0]
+    assert heading == "# Agent instructions — canonical"
 
 
-def test_force_without_yes_refuses_headlessly_and_writes_nothing(tmp_path: Path) -> None:
-    """The original crashed with EOFError AFTER writing the first file.
+def test_T07_sole_non_origin_remote_is_authoritative(tmp_path: Path) -> None:
+    """Origin absent + exactly one remote: it provides identity AND HEAD (T10)."""
+    repo = _make_repo(tmp_path, name="wt", remote=None, branch="main")
+    _add_remote(repo, "upstream", "https://example.com/o/canonical.git", head_branch="main")
+    result = _run(repo)
+    assert result.returncode == 0, result.stderr
+    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert body.splitlines()[0] == "# Agent instructions — canonical"
+    assert "## Branch from current `main`. Always." in body
 
-    A half-completed overwrite is worse than a refusal, so the guard must fire
-    before anything is written -- asserted by content, not just exit code.
-    """
-    repo = _make_repo(tmp_path, name="r3a", remote="https://example.com/o/r3a.git")
-    (repo / "AGENTS.md").write_text("ORIGINAL\n", encoding="utf-8")
+
+def test_T08_multiple_remotes_without_origin_refuses(tmp_path: Path) -> None:
+    """Do not choose the first enumeration result; refuse the ambiguity."""
+    repo = _make_repo(tmp_path, name="wt", remote=None, branch="main")
+    _add_remote(repo, "alpha", "https://example.com/o/a.git", head_branch="main")
+    _add_remote(repo, "beta", "https://example.com/o/b.git", head_branch="main")
     before = _snapshot(repo)
 
-    result = _run(repo, "--force")
+    result = _run(repo, "--default-branch", "main")
     assert result.returncode != 0
-    assert "EOFError" not in result.stderr and "Traceback" not in result.stderr
+    assert not (repo / "AGENTS.md").exists()
     assert _snapshot(repo) == before
+    assert "multiple remotes" in result.stderr
 
 
-def test_force_with_yes_overwrites_headlessly(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, name="r3b", remote="https://example.com/o/r3b.git")
-    (repo / "AGENTS.md").write_text("ORIGINAL\n", encoding="utf-8")
+# --------------------------------------------------------------------------- #
+# Default branch (T09-T17)
+# --------------------------------------------------------------------------- #
 
-    result = _run(repo, "--force", "--yes")
-    assert result.returncode == 0
+
+def test_T09_origin_head_resolves(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git", branch="main")
+    assert _run(repo).returncode == 0
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
-    assert "ORIGINAL" not in body
-    assert body.startswith("# Agent instructions — r3b")
+    assert "## Branch from current `main`. Always." in body
 
 
-# --------------------------------------------------------------------------- #
-# Seed 3 — an undetectable default must never be written silently
-# --------------------------------------------------------------------------- #
-
-
-def test_undetectable_default_branch_refuses_headlessly(tmp_path: Path) -> None:
-    """THE POISON-PILL GUARD.
-
-    Repo on 'develop', no origin/HEAD, no local main/master. Writing here would
-    put "branch from main" into a canonical file naming a branch that is not this
-    repo's default -- and replicate that across every repo scaffolded the same
-    way. It must refuse, and it must write nothing.
-    """
-    repo = _make_repo(tmp_path, name="r4", branch="develop", remote=None)
-
+def test_T10_sole_non_origin_remote_head_resolves(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="wt", remote=None, branch="trunk")
+    _add_remote(repo, "upstream", "https://example.com/o/canonical.git", head_branch="trunk")
     result = _run(repo)
-    assert result.returncode != 0, "wrote on a guessed default branch"
-    assert not (repo / "AGENTS.md").exists(), "wrote a file it could not name correctly"
+    assert result.returncode == 0, result.stderr
+    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert "## Branch from current `trunk`. Always." in body
+    # The branch name was resolved from the sole non-origin remote's HEAD, and
+    # identity likewise came from that remote — not from the local 'trunk' or the
+    # directory name. (The generated body still references `origin/` by
+    # convention; that is the frozen render contract, unchanged here.)
+    assert body.splitlines()[0] == "# Agent instructions — canonical"
+
+
+def test_T11_no_symbolic_remote_head_refuses_even_with_local_main(tmp_path: Path) -> None:
+    """origin present but no origin/HEAD, and a local main exists: still refuse.
+
+    The removed behaviour probed local main/master; it must be gone.
+    """
+    repo = _make_repo(
+        tmp_path, name="r", remote="https://example.com/o/r.git", branch="main", origin_head=False
+    )
+    result = _run(repo)
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
     assert "could not detect the default branch" in result.stderr
     assert "--default-branch" in result.stderr
 
 
-def test_default_branch_override_is_used_throughout(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, name="r4b", branch="develop", remote=None)
-
+def test_T12_explicit_existing_local_branch_accepted(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote=None, branch="develop")
     result = _run(repo, "--default-branch", "develop")
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
     assert "## Branch from current `develop`. Always." in body
-    assert "origin/develop" in body
-    # The self-check must assert against develop, not a stray 'main'.
     assert "git merge-base HEAD origin/develop" in body
     assert "origin/main" not in body
 
 
-# --------------------------------------------------------------------------- #
-# Seed 4 — happy path, never-overwrite, non-git
-# --------------------------------------------------------------------------- #
-
-
-def test_happy_path_writes_the_workflow_entry_point(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, name="r5", remote="https://example.com/o/r5.git")
-
-    result = _run(repo)
-    assert result.returncode == 0
+def test_T13_explicit_existing_remote_tracking_branch_accepted(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git", branch="main")
+    # A remote-tracking ref that is not a local branch.
+    _git(repo, "update-ref", "refs/remotes/origin/release", "HEAD")
+    result = _run(repo, "--default-branch", "release")
+    assert result.returncode == 0, result.stderr
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
-    assert "WRITE" in result.stdout
-    assert "## Branch from current `main`. Always." in body
-    assert "## Self-check before opening a pull request" in body
+    assert "## Branch from current `release`. Always." in body
 
 
-def test_second_run_does_not_clobber(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, name="r5b", remote="https://example.com/o/r5b.git")
+def test_T14_explicit_nonexistent_branch_refuses(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git", branch="main")
+    before = _snapshot(repo)
+    result = _run(repo, "--default-branch", "no-such-branch")
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+    assert _snapshot(repo) == before
+    assert "no-such-branch" in result.stderr
+
+
+def test_T15_current_branch_is_never_a_fallback(tmp_path: Path) -> None:
+    """On a checked-out branch with no remote HEAD, do not adopt the current branch."""
+    repo = _make_repo(tmp_path, name="r", remote=None, branch="feature-x")
+    result = _run(repo)
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+    assert "could not detect the default branch" in result.stderr
+
+
+def test_T16_lone_local_branch_is_never_a_fallback(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote=None, branch="trunk")
+    result = _run(repo)
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+
+
+def test_T17_init_default_branch_config_is_ignored(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote=None, branch="dev")
+    _git(repo, "config", "init.defaultBranch", "main")
+    result = _run(repo)
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+    assert "could not detect the default branch" in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Authority (T18-T24)
+# --------------------------------------------------------------------------- #
+
+
+def test_T18_existing_agents_md_is_preserved(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git")
     assert _run(repo).returncode == 0
     (repo / "AGENTS.md").write_text("HAND EDITED\n", encoding="utf-8")
 
@@ -254,7 +340,179 @@ def test_second_run_does_not_clobber(tmp_path: Path) -> None:
     assert "SKIP" in result.stdout
 
 
-def test_refuses_a_non_git_directory(tmp_path: Path) -> None:
+def test_T19_claude_md_without_disposition_refuses(tmp_path: Path) -> None:
+    repo = _make_repo(
+        tmp_path,
+        name="r",
+        remote="https://example.com/o/r.git",
+        files={"CLAUDE.md": "# Orientation\n"},
+    )
+    before = _snapshot(repo)
+    result = _run(repo)
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+    assert _snapshot(repo) == before
+    assert "CLAUDE.md" in result.stderr
+    assert "--authority-disposition" in result.stderr
+
+
+def test_T20_contributing_md_without_disposition_refuses(tmp_path: Path) -> None:
+    """No prose inference: an unrelated CONTRIBUTING.md still refuses closed."""
+    repo = _make_repo(
+        tmp_path,
+        name="r",
+        remote="https://example.com/o/r.git",
+        files={"CONTRIBUTING.md": "# Contributing\n\nBe kind. File issues.\n"},
+    )
+    before = _snapshot(repo)
+    result = _run(repo)
+    assert result.returncode != 0
+    assert _snapshot(repo) == before
+    assert "not proof that they overlap" in result.stderr
+
+
+def test_T21_covers_workflow_is_a_successful_no_op(tmp_path: Path) -> None:
+    """EXISTING_AUTHORITY_COVERS_WORKFLOW: exit 0, no AGENTS.md, zero mutation."""
+    repo = _make_repo(
+        tmp_path,
+        name="r",
+        remote="https://example.com/o/r.git",
+        files={"CONTRIBUTING.md": "# Contributing\n\n## Branching\n"},
+    )
+    before = _snapshot(repo)
+
+    result = _run(repo, "--authority-disposition", "EXISTING_AUTHORITY_COVERS_WORKFLOW")
+    assert result.returncode == 0, result.stderr
+    assert not (repo / "AGENTS.md").exists()
+    assert _snapshot(repo) == before
+    assert "SKIP" in result.stdout
+    assert "covers" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "disposition", ["COEXISTENCE_EXPLICITLY_ALLOWED", "NO_OVERLAP_CONFIRMED"]
+)
+def test_T22_T23_approved_coexistence_delegates_rather_than_duplicating(
+    tmp_path: Path, disposition: str
+) -> None:
+    """The CNC pattern: name the local authority, restate nothing it contains."""
+    repo = _make_repo(
+        tmp_path,
+        name="r",
+        remote="https://example.com/o/r.git",
+        files={"CLAUDE.md": "# Project context\n\nArchitecture rules live here.\n"},
+    )
+
+    result = _run(repo, "--authority-disposition", disposition)
+    assert result.returncode == 0, result.stderr
+    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert "`CLAUDE.md`" in body
+    assert "apply too" in body
+    assert "restates nothing found there" in body
+    assert "`CLAUDE.md` carry" not in body
+    assert "Architecture rules live here" not in body
+    assert (repo / "CLAUDE.md").read_text(encoding="utf-8").startswith("# Project context")
+
+
+def test_T24_invalid_disposition_refuses(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git")
+    result = _run(repo, "--authority-disposition", "MADE_UP_DISPOSITION")
+    assert result.returncode != 0
+    assert not (repo / "AGENTS.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Consent / atomicity (T25-T28)
+# --------------------------------------------------------------------------- #
+
+
+def test_T25_clean_headless_first_write_needs_no_yes(tmp_path: Path) -> None:
+    """A valid clean headless first creation requires no --yes."""
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git")
+    result = _run(repo)  # stdin is closed by _run
+    assert result.returncode == 0, result.stderr
+    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert "WRITE" in result.stdout
+    assert "## Branch from current `main`. Always." in body
+
+
+def test_T26_existing_agents_force_without_yes_refuses_headlessly(tmp_path: Path) -> None:
+    """--force without --yes in a non-TTY refuses before writing anything."""
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git")
+    (repo / "AGENTS.md").write_text("ORIGINAL\n", encoding="utf-8")
+    before = _snapshot(repo)
+
+    result = _run(repo, "--force")
+    assert result.returncode != 0
+    assert "EOFError" not in result.stderr and "Traceback" not in result.stderr
+    assert _snapshot(repo) == before
+
+
+def test_T26_force_with_yes_overwrites_headlessly(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git")
+    (repo / "AGENTS.md").write_text("ORIGINAL\n", encoding="utf-8")
+
+    result = _run(repo, "--force", "--yes")
+    assert result.returncode == 0
+    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
+    assert "ORIGINAL" not in body
+    assert body.startswith("# Agent instructions — r")
+
+
+@pytest.mark.parametrize("case", ["invalid_branch", "unresolved_authority", "unresolved_branch"])
+def test_T27_force_and_yes_cannot_bypass_truth_checks(tmp_path: Path, case: str) -> None:
+    """--force is replacement intent and --yes is consent; neither is authority."""
+    if case == "invalid_branch":
+        repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git", branch="main")
+        args: tuple[str, ...] = ("--default-branch", "no-such-branch", "--force", "--yes")
+    elif case == "unresolved_authority":
+        repo = _make_repo(
+            tmp_path,
+            name="r",
+            remote="https://example.com/o/r.git",
+            files={"CLAUDE.md": "# ctx\n"},
+        )
+        args = ("--force", "--yes")
+    else:  # unresolved_branch
+        repo = _make_repo(tmp_path, name="r", remote="https://example.com/o/r.git", origin_head=False)
+        args = ("--force", "--yes")
+
+    before = _snapshot(repo)
+    result = _run(repo, *args)
+    assert result.returncode != 0, case
+    assert not (repo / "AGENTS.md").exists(), case
+    assert _snapshot(repo) == before, case
+
+
+def test_T28_atomic_write_failure_preserves_original(tmp_path: Path, monkeypatch) -> None:
+    """A failed os.replace leaves the original intact and removes the temp file.
+
+    Mocking is authorised here and only here: a replacement failure cannot be
+    provoked from outside the process.
+    """
+    module = _load_module()
+    target = tmp_path / "AGENTS.md"
+    target.write_text("ORIGINAL\n", encoding="utf-8")
+
+    def boom(src, dst):  # noqa: ANN001
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(module.os, "replace", boom)
+
+    with pytest.raises(OSError):
+        module.atomic_write_text(target, "NEW CONTENT THAT MUST NOT LAND")
+
+    assert target.read_text(encoding="utf-8") == "ORIGINAL\n"
+    residue = [p.name for p in tmp_path.iterdir() if p.name != "AGENTS.md"]
+    assert residue == [], f"temporary residue left behind: {residue}"
+
+
+# --------------------------------------------------------------------------- #
+# The generated artifact stays narrow (frozen semantics, Section 8)
+# --------------------------------------------------------------------------- #
+
+
+def test_non_git_directory_is_refused(tmp_path: Path) -> None:
     plain = tmp_path / "not-a-repo"
     plain.mkdir()
     result = _run(plain)
@@ -262,138 +520,20 @@ def test_refuses_a_non_git_directory(tmp_path: Path) -> None:
     assert not (plain / "AGENTS.md").exists()
 
 
-# --------------------------------------------------------------------------- #
-# Contract 1 — authority collision fails closed
-# --------------------------------------------------------------------------- #
-
-
-def test_a_ttp_like_repository_is_refused_with_zero_mutation(tmp_path: Path) -> None:
-    """The grounded case, and the reason the signal list includes CONTRIBUTING.
-
-    In tap_tone_pi, CLAUDE.md is the project/measurement authority while
-    CONTRIBUTING.md owns branch and pull-request workflow. A preflight checking
-    only CLAUDE.md would see no workflow authority there and conclude a
-    delegating AGENTS.md was permissible -- the wrong answer, reached by
-    checking the wrong file.
-    """
-    repo = _make_repo(
-        tmp_path,
-        name="tap_tone_pi",
-        remote="https://example.com/o/tap_tone_pi.git",
-        files={
-            "CLAUDE.md": "# Orientation\n\nMeasurement boundary.\n",
-            "CONTRIBUTING.md": "# Contributing\n\n## Branching\n\n## Pull Requests\n",
-        },
-    )
-    before = _snapshot(repo)
-
-    result = _run(repo)
-    assert result.returncode != 0
-    assert not (repo / "AGENTS.md").exists()
-    assert _snapshot(repo) == before
-    assert "CLAUDE.md" in result.stderr and "CONTRIBUTING.md" in result.stderr
-    assert "--authority-disposition" in result.stderr
-
-
-def test_an_unrelated_contributing_still_refuses_automatically(tmp_path: Path) -> None:
-    """No prose inference, in either direction.
-
-    This CONTRIBUTING.md says nothing about branches. v1 must still refuse rather
-    than concluding non-overlap from the text -- deciding it "obviously does not
-    overlap" is the same semantic classification as deciding that it does, and
-    reintroduces the judgment through a side door.
-    """
-    repo = _make_repo(
-        tmp_path,
-        name="r6b",
-        remote="https://example.com/o/r6b.git",
-        files={"CONTRIBUTING.md": "# Contributing\n\nBe kind. File issues.\n"},
-    )
-    before = _snapshot(repo)
-
-    result = _run(repo)
-    assert result.returncode != 0
-    assert _snapshot(repo) == before
-    assert "not proof that they overlap" in result.stderr
-
-
-def test_operator_may_rule_that_existing_authority_covers_workflow(tmp_path: Path) -> None:
-    repo = _make_repo(
-        tmp_path,
-        name="r6c",
-        remote="https://example.com/o/r6c.git",
-        files={"CONTRIBUTING.md": "# Contributing\n\n## Branching\n"},
-    )
-    before = _snapshot(repo)
-
-    result = _run(repo, "--authority-disposition", "EXISTING_AUTHORITY_COVERS_WORKFLOW")
-    assert result.returncode != 0
-    assert not (repo / "AGENTS.md").exists()
-    assert _snapshot(repo) == before
-
-
-@pytest.mark.parametrize(
-    "disposition", ["COEXISTENCE_EXPLICITLY_ALLOWED", "NO_OVERLAP_CONFIRMED"]
-)
-def test_approved_coexistence_delegates_rather_than_duplicating(
-    tmp_path: Path, disposition: str
-) -> None:
-    """The CNC pattern: name the local authority, restate nothing it contains."""
-    repo = _make_repo(
-        tmp_path,
-        name="r6d",
-        remote="https://example.com/o/r6d.git",
-        files={"CLAUDE.md": "# Project context\n\nArchitecture rules live here.\n"},
-    )
-
-    result = _run(repo, "--authority-disposition", disposition)
-    assert result.returncode == 0
-    body = (repo / "AGENTS.md").read_text(encoding="utf-8")
-    assert "`CLAUDE.md`" in body
-    assert "apply too" in body
-    assert "restates nothing found there" in body
-    # Reads correctly for one authority as well as several. A generated file
-    # lands in repositories nobody proofreads it in.
-    assert "`CLAUDE.md` carry" not in body
-    # Delegation, not duplication: the other authority's content is not copied.
-    assert "Architecture rules live here" not in body
-    # And the local authority is untouched.
-    assert (repo / "CLAUDE.md").read_text(encoding="utf-8").startswith("# Project context")
-
-
-# --------------------------------------------------------------------------- #
-# Contract 2 — the generated artifact stays narrow
-# --------------------------------------------------------------------------- #
-
-
 def test_no_incident_history_is_invented_or_stubbed(tmp_path: Path) -> None:
-    """An incident that justified a rule elsewhere is evidence, not boilerplate.
-
-    The original scaffolder emitted TODO blocks for incidents and verification
-    gates. Even as placeholders those assert that every repository owes an
-    incident history, so v1 emits neither the history nor the placeholder.
-    """
     repo = _make_repo(tmp_path, name="r7", remote="https://example.com/o/r7.git")
     assert _run(repo).returncode == 0
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
-
     assert "INCIDENTS" not in body
     assert "VERIFICATION GATES" not in body
     assert "TODO" not in body
-    # Nor any other repository's specific history.
     for foreign in ("#12", "#13", "#14", "CNC Production Shop"):
         assert foreign not in body
 
 
 def test_the_tool_has_no_pr_template_capability_at_all(tmp_path: Path) -> None:
-    """Architectural absence, not a disabled feature.
-
-    A future change adding PR-template generation should read as a scope
-    expansion in the diff, not as flipping a flag on machinery already present.
-    """
     repo = _make_repo(tmp_path, name="r7b", remote="https://example.com/o/r7b.git")
     assert _run(repo).returncode == 0
-
     assert not (repo / ".github").exists()
     assert list(repo.glob("**/pull_request_template.md")) == []
     source = SCAFFOLDER.read_text(encoding="utf-8")
@@ -405,16 +545,14 @@ def test_the_artifact_is_workflow_only(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path, name="r7c", remote="https://example.com/o/r7c.git")
     assert _run(repo).returncode == 0
     body = (repo / "AGENTS.md").read_text(encoding="utf-8")
-
     assert "## Branch from current" in body
     assert "## Self-check before opening a pull request" in body
-    # It must not start inventing project or architecture instruction.
     for foreign in ("## Repository Structure", "## Architecture", "## Testing"):
         assert foreign not in body
 
 
 # --------------------------------------------------------------------------- #
-# Contract 3 — every refusal path leaves the repository untouched
+# Every refusal path leaves the repository untouched (frozen invariant)
 # --------------------------------------------------------------------------- #
 
 
@@ -424,15 +562,11 @@ def test_the_artifact_is_workflow_only(tmp_path: Path) -> None:
         "undetectable_branch",
         "force_without_yes",
         "authority_unresolved",
-        "authority_covers_workflow",
+        "multiple_remotes",
     ],
 )
 def test_every_refusal_path_mutates_nothing(tmp_path: Path, case: str) -> None:
-    """Generalizes the EOFError-after-first-write defect beyond its one shape.
-
-    The invariant is preflight-before-mutation, not the number of files written,
-    so it is asserted against the whole repository rather than one path.
-    """
+    """Generalizes the EOFError-after-first-write defect beyond its one shape."""
     if case == "undetectable_branch":
         repo = _make_repo(tmp_path, name="z1", branch="develop", remote=None)
         args: tuple[str, ...] = ()
@@ -448,14 +582,11 @@ def test_every_refusal_path_mutates_nothing(tmp_path: Path, case: str) -> None:
             files={"CLAUDE.md": "# ctx\n"},
         )
         args = ()
-    else:
-        repo = _make_repo(
-            tmp_path,
-            name="z4",
-            remote="https://example.com/o/z4.git",
-            files={"CONTRIBUTING.md": "# c\n"},
-        )
-        args = ("--authority-disposition", "EXISTING_AUTHORITY_COVERS_WORKFLOW")
+    else:  # multiple_remotes
+        repo = _make_repo(tmp_path, name="z4", remote=None, branch="main")
+        _add_remote(repo, "a", "https://example.com/o/a.git", head_branch="main")
+        _add_remote(repo, "b", "https://example.com/o/b.git", head_branch="main")
+        args = ("--default-branch", "main")
 
     before = _snapshot(repo)
     result = _run(repo, *args)
